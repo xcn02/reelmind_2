@@ -139,7 +139,7 @@ class ReelWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
                                 .joinToString(" | ").take(220)
                         }
                     }
-                    if (needVisuals && visualImages.isNotEmpty()) {
+                    if (needVisuals && visualImages.isNotEmpty() && (!isVideo || shouldSampleVideo)) {
                         try {
                             val geminiKey = applicationContext.getSharedPreferences("settings", 0)
                                 .getString("key_Gemini", "").orEmpty()

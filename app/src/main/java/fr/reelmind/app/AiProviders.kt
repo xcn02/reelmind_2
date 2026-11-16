@@ -24,10 +24,19 @@ object AiProviders {
                 throw IllegalStateException("Réponse invalide (HTTP $status)")
             }
             if (status !in 200..299) {
-                throw IllegalStateException(data.optJSONObject("error")?.optString("message")
-                    ?.take(220)?.ifBlank { null } ?: "Erreur du fournisseur (HTTP $status)")
+                val reason = data.optJSONObject("error")?.optString("message")?.take(180).orEmpty()
+                val explanation = when (status) {
+                    429 -> "Quota ou limite de débit atteint (HTTP 429). Attends le renouvellement avant de relancer."
+                    503 -> "Modèle temporairement surchargé (HTTP 503). Réessaie manuellement plus tard."
+                    else -> "Erreur du fournisseur (HTTP $status)"
+                }
+                throw IllegalStateException("$explanation ${reason.take(90)}".trim())
             }
             return data
+        } catch (e: java.net.SocketException) {
+            throw IllegalStateException("Connexion interrompue par le réseau ou le serveur. Vérifie la connexion puis réessaie manuellement. (${e.message})", e)
+        } catch (e: java.net.SocketTimeoutException) {
+            throw IllegalStateException("Délai réseau dépassé. Le résultat de la requête est incertain : vérifie ton quota avant de relancer.", e)
         } finally { conn.disconnect() }
     }
 

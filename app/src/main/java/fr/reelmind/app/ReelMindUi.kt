@@ -9,6 +9,14 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material.icons.Icons
@@ -43,7 +51,7 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
     var newUrl by remember { mutableStateOf("") }
     var newCaption by remember { mutableStateOf("") }
     var showChat by remember { mutableStateOf(false) }
-    var libraryQuestion by remember { mutableStateOf("") }
+    var reelChatId by remember { mutableStateOf<Long?>(null) }
     var showCategories by remember { mutableStateOf(false) }
     var showAllCategories by remember { mutableStateOf(false) }
     var categoryRevision by remember { mutableIntStateOf(0) }
@@ -62,7 +70,9 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
         vm.pendingUrl?.let { newUrl = it; newCaption = vm.pendingCaption; showAdd = true; vm.pendingUrl = null; vm.pendingCaption = "" }
     }
     // The detail composable persists its draft on disposal; returning never loses edits.
-    BackHandler(selected != null) { selected = null }
+    BackHandler(showChat) { showChat = false; vm.endLibraryChat() }
+    BackHandler(reelChatId != null) { reelChatId = null; vm.endChat() }
+    BackHandler(selected != null && reelChatId == null) { selected = null }
     MaterialTheme(colorScheme = scheme) {
         Scaffold(
             containerColor = MaterialTheme.colorScheme.background,
@@ -72,6 +82,16 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
                     Row(Modifier.fillMaxWidth().statusBarsPadding().height(60.dp).padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
                         if (selected != null) IconButton(onClick = { selected = null }) { Icon(Icons.Default.ArrowBack, "Retour") }
                         Text(if (selected == null) "ReelMind" else "Fiche", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        if (selected != null) {
+                            val index = vm.reels.indexOfFirst { it.id == selected!!.id }
+                            IconButton(onClick = { if (index > 0) selected = vm.reels[index - 1] }, enabled = index > 0) {
+                                Icon(Icons.Default.ChevronLeft, "Fiche précédente")
+                            }
+                            IconButton(onClick = { if (index >= 0 && index < vm.reels.lastIndex) selected = vm.reels[index + 1] },
+                                enabled = index >= 0 && index < vm.reels.lastIndex) {
+                                Icon(Icons.Default.ChevronRight, "Fiche suivante")
+                            }
+                        }
                         if (selected == null && tab != 2) IconButton(onClick = { tab = 2 }) { Icon(Icons.Default.Settings, "Paramètres") }
                     }
                 }
@@ -92,17 +112,32 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
                 if (selected != null) {
                     val reel = vm.reels.firstOrNull { it.id == selected!!.id } ?: selected!!
                     val editBaseline = remember(reel.id) { reel }
+                    var swipeDistance by remember(reel.id) { mutableFloatStateOf(0f) }
+                    Box(Modifier.fillMaxSize().pointerInput(reel.id, vm.reels.size) {
+                        detectHorizontalDragGestures(onDragStart = { swipeDistance = 0f },
+                            onDragEnd = {
+                                val current = vm.reels.indexOfFirst { it.id == reel.id }
+                                val threshold = 105.dp.toPx()
+                                if (kotlin.math.abs(swipeDistance) > threshold && current >= 0) {
+                                    val next = if (swipeDistance < 0) current + 1 else current - 1
+                                    if (next in vm.reels.indices) selected = vm.reels[next]
+                                }
+                                swipeDistance = 0f
+                            }, onHorizontalDrag = { change, amount ->
+                                change.consume(); swipeDistance += amount
+                            })
+                    }) {
                     DetailV51(reel, categories, onSave = { vm.saveEditable(it, editBaseline) },
                         onSaveSummary = { vm.saveSummary(reel, it) },
                         onDelete = { vm.remove(reel); selected = null },
                         onSummarize = vm::summarize, busy = vm.processingId == reel.id,
                         onExport = { activity.shareText(exportMarkdown(reel)) }, onOpen = { activity.openUrl(reel.url) },
-                        onSpeak = { activity.speak(reel.summary) }, onImport = { mime -> activity.chooseMedia(mime) { uri -> vm.importMedia(reel, uri) } },
-                        onRetry = { vm.retry(reel) }, messages = vm.messages, onChatOpen = { vm.observeChat(reel.id) },
-                        onAsk = { vm.askReel(reel, it) }, chatBusy = vm.chatAnswering,
+                        onImport = { mime -> activity.chooseMedia(mime) { uri -> vm.importMedia(reel, uri) } },
+                        onRetry = { vm.retry(reel) }, onChatOpen = { vm.startChat(reel.id); reelChatId = reel.id },
                         onManageCategories = { showCategories = true },
                         onShareLink = { activity.shareText(reel.url) },
                         onDownload = { vm.downloadVideo(reel) { feedback = it } })
+                    }
                 } else if (tab == 2) {
                     SettingsV51(vm, activity, themePreference, { value -> themePreference = value; prefs.edit().putString("theme", value).apply() }, onManageCategories = { showCategories = true })
                 } else {
@@ -112,7 +147,7 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
                     }
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 90.dp)) {
                         if (tab == 0) {
-                            item { SearchEntry(search, { search = it; if (it.isNotBlank()) tab = 1 }, onBrain = { showChat = true }) }
+                            item { SearchEntry(search, { search = it; filter = "Tout"; tab = 1 }, compact = true) }
                             item { SectionTitle("Récemment enregistrés") }
                             item {
                                 if (vm.reels.isEmpty()) Text("Partage ton premier Reel depuis Instagram.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -130,11 +165,18 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
                             }
                             item { SectionTitle("Toutes les fiches") }
                         } else {
-                            item { SearchEntry(search, { search = it }, onBrain = { showChat = true }) }
-                            item { SectionTitle("Rechercher dans ma bibliothèque") }
+                            item { Text("Rechercher", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold) }
+                            item { SearchEntry(search, { search = it }) }
+                            item { LibraryAiEntry { vm.endLibraryChat(); showChat = true } }
+                            item { Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(if (search.isBlank()) "Explorer les fiches" else "Résultats de recherche", Modifier.weight(1f),
+                                    fontWeight = FontWeight.SemiBold)
+                                Text("${shown.size} fiches", color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelSmall)
+                            } }
                             item {
                                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    items(listOf("Tout") + categories.map { it.name } + vm.reels.map { it.category }.filter { it != "À classer" && categories.none { cat -> cat.name == it } }.distinct()) { item ->
+                                    items((listOf("Tout") + categories.map { it.name } + vm.reels.map { it.category }.filter { name -> categories.none { cat -> cat.name == name } }).distinct()) { item ->
                                         FilterChip(selected = filter == item, onClick = { filter = item }, label = { Text(item) })
                                     }
                                 }
@@ -155,14 +197,12 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
                 if (oldName != null && newName != null && oldName != newName) vm.changeCategory(oldName, newName)
                 categoryRevision++
             })
-        if (showChat) AlertDialog(onDismissRequest = { showChat = false }, title = { Text("Question à ma bibliothèque") }, text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Interroge les fiches déjà analysées.")
-                OutlinedTextField(libraryQuestion, { libraryQuestion = it }, label = { Text("Ta question") }, modifier = Modifier.fillMaxWidth())
-                if (vm.libraryAsking) CircularProgressIndicator()
-                if (vm.libraryAnswer.isNotBlank()) Text(vm.libraryAnswer)
-            }
-        }, confirmButton = { TextButton(onClick = { vm.askLibrary(libraryQuestion) }, enabled = libraryQuestion.isNotBlank() && !vm.libraryAsking) { Text("Interroger") } }, dismissButton = { TextButton(onClick = { showChat = false }) { Text("Fermer") } })
+        reelChatId?.let { chatId ->
+            val chatReel = vm.reels.firstOrNull { it.id == chatId }
+            if (chatReel != null) ReelChatDialog(chatReel, vm.messages, vm.chatAnswering,
+                onDismiss = { reelChatId = null; vm.endChat() }, onAsk = { vm.askReel(chatReel, it) })
+        }
+        if (showChat) LibraryChatDialog(vm, onDismiss = { showChat = false; vm.endLibraryChat() })
         if (showAdd) AlertDialog(onDismissRequest = { showAdd = false }, title = { Text("Enregistrer une publication") }, text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(newUrl, { newUrl = it }, label = { Text("Lien Instagram") }, modifier = Modifier.fillMaxWidth())
@@ -178,10 +218,131 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
 
 @Composable private fun SectionTitle(title: String) { Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold) }
 
-@Composable private fun SearchEntry(value: String, onChange: (String) -> Unit, onBrain: () -> Unit) {
-    OutlinedTextField(value, onChange, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp),
-        placeholder = { Text("Rechercher dans mes Reels…") }, leadingIcon = { Icon(Icons.Default.Search, null) },
-        trailingIcon = { IconButton(onClick = onBrain) { Icon(Icons.Default.AutoAwesome, "Interroger ma bibliothèque") } })
+@Composable private fun SearchEntry(value: String, onChange: (String) -> Unit, compact: Boolean = false) {
+    OutlinedTextField(value, onChange, singleLine = true, modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        placeholder = { Text(if (compact) "Rechercher un Reel…" else "Titre, auteur, contenu, transcription…") },
+        leadingIcon = { Icon(Icons.Default.Search, null) },
+        trailingIcon = { if (value.isNotBlank()) IconButton(onClick = { onChange("") }) { Icon(Icons.Default.Close, "Effacer") } })
+}
+
+@Composable private fun LibraryAiEntry(onClick: () -> Unit) {
+    Surface(onClick = onClick, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.52f)) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)) {
+                Icon(Icons.Default.AutoAwesome, null, Modifier.padding(11.dp), tint = MaterialTheme.colorScheme.primary)
+            }
+            Column(Modifier.weight(1f)) {
+                Text("Recherche IA", fontWeight = FontWeight.SemiBold)
+                Text("Poser une question sur mes Reels", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.primary)
+        }
+    }
+}
+
+@Composable private fun LibraryChatDialog(vm: ReelModel, onDismiss: () -> Unit) {
+    var input by remember { mutableStateOf("") }
+    val sessionMessages = remember { mutableStateListOf<Pair<Boolean, String>>() }
+    var pendingQuestion by remember { mutableStateOf<String?>(null) }
+    val listState = rememberLazyListState()
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(vm.libraryAnswer, vm.libraryAsking) {
+        if (!vm.libraryAsking && pendingQuestion != null && vm.libraryAnswer.isNotBlank()) {
+            sessionMessages.add(false to vm.libraryAnswer)
+            pendingQuestion = null
+        }
+    }
+    LaunchedEffect(sessionMessages.size, vm.libraryAsking) {
+        if (sessionMessages.isNotEmpty()) listState.animateScrollToItem(sessionMessages.size - 1)
+    }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding(),
+            color = MaterialTheme.colorScheme.background) {
+            Column(Modifier.fillMaxSize()) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onDismiss) { Icon(Icons.Default.ArrowBack, "Retour") }
+                    Column(Modifier.weight(1f)) {
+                        Text("Recherche IA", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
+                        Text("Conversation temporaire · Bibliothèque", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Icon(Icons.Default.AutoAwesome, null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                }
+                HorizontalDivider()
+                LazyColumn(Modifier.weight(1f), state = listState, contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (sessionMessages.isEmpty()) item {
+                        Column(Modifier.fillMaxWidth().padding(top = 50.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Icon(Icons.Default.AutoAwesome, null, Modifier.size(34.dp), tint = MaterialTheme.colorScheme.primary)
+                            Text("Interroger ma bibliothèque", style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold)
+                            Text("Pose une question sur les fiches déjà analysées. La discussion ne sera pas conservée.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            listOf("Quels conseils reviennent le plus ?", "Résume mes Reels sur la finance").forEach { suggestion ->
+                                OutlinedButton(onClick = {
+                                    val history = sessionMessages.joinToString("\n") { (mine, txt) -> "${if (mine) "Utilisateur" else "Assistant"}: $txt" }
+                                    sessionMessages.add(true to suggestion)
+                                    pendingQuestion = suggestion
+                                    vm.askLibrary(suggestion, history)
+                                }, enabled = !vm.libraryAsking) { Text(suggestion) }
+                            }
+                        }
+                    }
+                    items(sessionMessages.size) { i ->
+                        val (mine, content) = sessionMessages[i]
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+                            Surface(shape = RoundedCornerShape(18.dp),
+                                color = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.widthIn(max = 320.dp)) {
+                                Text(content, Modifier.padding(horizontal = 14.dp, vertical = 11.dp))
+                            }
+                        }
+                    }
+                    if (vm.libraryAsking) item {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Text("Analyse des fiches…", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                HorizontalDivider()
+                Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(input, { input = it }, modifier = Modifier.weight(1f),
+                        placeholder = { Text("Poser une question…") }, maxLines = 4,
+                        shape = RoundedCornerShape(24.dp),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                        keyboardActions = KeyboardActions(onSend = {
+                            if (input.isNotBlank() && !vm.libraryAsking) {
+                                val question = input.trim()
+                                val history = sessionMessages.joinToString("\n") { (mine, txt) -> "${if (mine) "Utilisateur" else "Assistant"}: $txt" }
+                                sessionMessages.add(true to question); pendingQuestion = question
+                                vm.askLibrary(question, history); input = ""; keyboard?.hide()
+                            }
+                        }))
+                    IconButton(onClick = {
+                        val question = input.trim()
+                        if (question.isNotBlank() && !vm.libraryAsking) {
+                            val history = sessionMessages.joinToString("\n") { (mine, txt) -> "${if (mine) "Utilisateur" else "Assistant"}: $txt" }
+                            sessionMessages.add(true to question); pendingQuestion = question
+                            vm.askLibrary(question, history); input = ""; keyboard?.hide()
+                        }
+                    }, enabled = input.isNotBlank() && !vm.libraryAsking) {
+                        Icon(Icons.Default.Send, "Envoyer", tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable private fun RecentCard(reel: Reel, onClick: () -> Unit) {
@@ -204,11 +365,11 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 pair.forEach { cat ->
                     Card(onClick = { if (cat == null) onMore() else onPick(cat.name) },
-                        modifier = Modifier.weight(1f).height(104.dp),
+                        modifier = Modifier.weight(1f).height(86.dp),
                         shape = RoundedCornerShape(15.dp)) {
-                        Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.SpaceBetween) {
+                        Column(Modifier.fillMaxSize().padding(10.dp), verticalArrangement = Arrangement.SpaceBetween) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Box(Modifier.size(35.dp).background(
+                                Box(Modifier.size(32.dp).background(
                                     if (cat == null) MaterialTheme.colorScheme.primaryContainer else Color(cat.color).copy(alpha = 0.13f),
                                     RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
                                     if (cat == null) Icon(Icons.Default.MoreHoriz, null, tint = MaterialTheme.colorScheme.primary)
@@ -316,6 +477,7 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable private fun CategoryManager(categories: List<ReelCategory>, onDismiss: () -> Unit,
     onReclassify: () -> Unit,
     onChanged: (List<ReelCategory>, String?, String?) -> Unit) {
@@ -326,10 +488,10 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
     val latestOnChanged by rememberUpdatedState(onChanged)
     val rowStep = with(LocalDensity.current) { 54.dp.toPx() }
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Gérer les catégories") }, text = {
-        Column(Modifier.heightIn(max = 470.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            categories.forEach { cat ->
+        LazyColumn(Modifier.heightIn(max = 470.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            items(categories, key = { it.name }) { cat ->
                 var dragAccum by remember(cat.name) { mutableFloatStateOf(0f) }
-                Row(Modifier.fillMaxWidth().height(50.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().height(50.dp).animateItem(), verticalAlignment = Alignment.CenterVertically) {
                     // Drag from the grip; the rest of the row remains independently clickable.
                     Box(Modifier.size(42.dp).pointerInput(cat.name, rowStep) {
                         detectDragGesturesAfterLongPress(
@@ -360,22 +522,24 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
                     Text(cat.icon, modifier = Modifier.padding(end = 8.dp))
                     Text(cat.name, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.bodyMedium)
-                    IconButton(onClick = { editing = cat }, modifier = Modifier.size(40.dp)) {
+                    IconButton(onClick = { editing = cat }, modifier = Modifier.size(40.dp),
+                        enabled = cat.name != CategoryStore.UNCLASSIFIED) {
                         Icon(Icons.Default.Edit, "Modifier", modifier = Modifier.size(21.dp))
                     }
-                    IconButton(onClick = { deleting = cat }, modifier = Modifier.size(40.dp)) {
+                    IconButton(onClick = { deleting = cat }, modifier = Modifier.size(40.dp),
+                        enabled = cat.name != CategoryStore.UNCLASSIFIED) {
                         Icon(Icons.Default.DeleteOutline, "Supprimer", modifier = Modifier.size(21.dp))
                     }
                 }
             }
-            Button(onClick = { adding = true }, modifier = Modifier.fillMaxWidth()) {
+            item { Button(onClick = { adding = true }, modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Default.Add, null); Spacer(Modifier.width(8.dp)); Text("Ajouter une catégorie")
-            }
-            OutlinedButton(onClick = onReclassify, modifier = Modifier.fillMaxWidth()) {
+            } }
+            item { OutlinedButton(onClick = onReclassify, modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Default.AutoFixHigh, null); Spacer(Modifier.width(8.dp)); Text("Classer sans IA")
-            }
-            Text("Maintiens la poignée ≡ puis fais glisser la catégorie pour changer son ordre.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } }
+            item { Text("Toutes les catégories, y compris « À classer », sont repositionnables. Maintiens la poignée ≡ pour les déplacer.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
     }, confirmButton = { TextButton(onClick = onDismiss) { Text("Fermer") } })
     if (adding || editing != null) CategoryEditor(categories, editing, onDismiss = { adding = false; editing = null }) { item ->
@@ -419,7 +583,8 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
                 colors.forEach { value -> Box(Modifier.size(34.dp).background(Color(value), RoundedCornerShape(30.dp)).clickable { color = value }, contentAlignment = Alignment.Center) { if (color == value) Icon(Icons.Default.Check, null, tint = Color.White) } }
             }
         }
-    }, confirmButton = { Button(onClick = { onSave(ReelCategory(name.trim(), icon, color, keywords.split(",").map { it.trim() }.filter { it.isNotBlank() }.distinct().take(10))) }, enabled = name.isNotBlank() && categories.none { it.name.equals(name.trim(), true) && it.name != original?.name }) { Text("Enregistrer") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } })
+    }, confirmButton = { Button(onClick = { onSave(ReelCategory(name.trim(), icon, color, keywords.split(",").map { it.trim() }.filter { it.isNotBlank() }.distinct().take(10))) }, enabled = name.isNotBlank() && !name.trim().equals(CategoryStore.UNCLASSIFIED, true) &&
+                categories.none { it.name.equals(name.trim(), true) && it.name != original?.name }) { Text("Enregistrer") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } })
 }
 
 /** Render structured model answers in readable sections without changing the stored raw summary. */
@@ -450,9 +615,8 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
 
 @Composable private fun DetailV51(reel: Reel, categories: List<ReelCategory>, onSave: (Reel) -> Unit,
     onSaveSummary: (String) -> Unit, onDelete: () -> Unit,
-    onSummarize: (Reel) -> Unit, busy: Boolean, onExport: () -> Unit, onOpen: () -> Unit, onSpeak: () -> Unit,
-    onImport: (String) -> Unit, onRetry: () -> Unit, messages: List<ChatMessage>, onChatOpen: () -> Unit,
-    onAsk: (String) -> Unit, chatBusy: Boolean, onManageCategories: () -> Unit,
+    onSummarize: (Reel) -> Unit, busy: Boolean, onExport: () -> Unit, onOpen: () -> Unit,
+    onImport: (String) -> Unit, onRetry: () -> Unit, onChatOpen: () -> Unit, onManageCategories: () -> Unit,
     onShareLink: () -> Unit, onDownload: () -> Unit) {
     var title by remember(reel.id) { mutableStateOf(reel.title) }
     var category by remember(reel.id) { mutableStateOf(reel.category) }
@@ -462,8 +626,6 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
     var captionExpanded by remember { mutableStateOf(false) }
     var transcriptExpanded by remember { mutableStateOf(false) }
     var sourceExpanded by remember { mutableStateOf(false) }
-    var chatExpanded by remember { mutableStateOf(false) }
-    var question by remember { mutableStateOf("") }
     var confirmDelete by remember { mutableStateOf(false) }
     var mediaMenu by remember { mutableStateOf(false) }
     val latestSave by rememberUpdatedState(onSave)
@@ -497,12 +659,22 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.weight(1f)) { ChoiceMenu(category, listOf("À classer") + categories.map { it.name }) { category = it } }
+            Box(Modifier.weight(1f)) { ChoiceMenu(category, categories.map { it.name }.distinct()) { category = it } }
             IconButton(onClick = onManageCategories) { Icon(Icons.Default.Settings, "Gérer les catégories") }
         }
         Text("Résumé IA", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         if (reel.summary.isNotBlank()) StructuredSummary(reel.summary)
         else Text("Pas encore de résumé. Il faut une transcription ou des images analysées.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Surface(onClick = onChatOpen, enabled = reel.summary.isNotBlank() || reel.mediaText.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.48f)) {
+            Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Default.ChatBubbleOutline, null, tint = MaterialTheme.colorScheme.primary)
+                Text("Poser une question sur ce Reel", Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+                Icon(Icons.Default.ArrowForward, null, tint = MaterialTheme.colorScheme.primary)
+            }
+        }
         HorizontalDivider()
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Analyse", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
@@ -546,16 +718,91 @@ fun ReelMindScreen(vm: ReelModel, activity: MainActivity) {
         Text("Mes notes", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
         OutlinedTextField(note, { note = it }, placeholder = { Text("Ajouter une remarque personnelle…") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
         Text("Modifications enregistrées automatiquement", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (reel.summary.isNotBlank()) OutlinedButton(onClick = onSpeak, modifier = Modifier.fillMaxWidth()) { Text("Écouter le résumé") }
-        OutlinedButton(onClick = { chatExpanded = !chatExpanded; if (chatExpanded) onChatOpen() }, modifier = Modifier.fillMaxWidth()) { Text(if (chatExpanded) "Masquer la discussion" else "Discuter avec ce Reel") }
-        if (chatExpanded) {
-            messages.forEach { msg -> Card { Column(Modifier.fillMaxWidth().padding(12.dp)) { Text(if (msg.role == "user") "Moi" else "ReelMind IA", fontWeight = FontWeight.Bold); Text(msg.content) } } }
-            OutlinedTextField(question, { question = it }, label = { Text("Question") }, modifier = Modifier.fillMaxWidth())
-            Button(onClick = { onAsk(question); question = "" }, enabled = question.isNotBlank() && !chatBusy) { Text("Envoyer") }
-        }
         OutlinedButton(onClick = onExport, modifier = Modifier.fillMaxWidth()) { Text("Partager / exporter la fiche") }
         TextButton(onClick = { confirmDelete = true }) { Text("Supprimer la fiche") }
         Spacer(Modifier.height(20.dp))
     }
     if (confirmDelete) AlertDialog(onDismissRequest = { confirmDelete = false }, title = { Text("Supprimer cette fiche ?") }, confirmButton = { TextButton(onClick = onDelete) { Text("Supprimer") } }, dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Annuler") } })
+}
+
+
+/** Full-screen ephemeral chat. Leaving this dialog discards the whole conversation. */
+@Composable private fun ReelChatDialog(reel: Reel, messages: List<ChatMessage>, busy: Boolean,
+    onDismiss: () -> Unit, onAsk: (String) -> Unit) {
+    var input by remember(reel.id) { mutableStateOf("") }
+    val listState = rememberLazyListState()
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(messages.size, busy) {
+        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+    }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding(),
+            color = MaterialTheme.colorScheme.background) {
+            Column(Modifier.fillMaxSize()) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onDismiss) { Icon(Icons.Default.ArrowBack, "Quitter le chat") }
+                    Column(Modifier.weight(1f)) {
+                        Text("Discuter avec ce Reel", fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.titleMedium)
+                        Text(reel.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "Fermer") }
+                }
+                HorizontalDivider()
+                LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState,
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (messages.isEmpty()) item {
+                        Column(Modifier.fillMaxWidth().padding(top = 48.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Icon(Icons.Default.AutoAwesome, null, Modifier.size(36.dp),
+                                tint = MaterialTheme.colorScheme.primary)
+                            Text("Pose une question sur ce Reel", fontWeight = FontWeight.SemiBold)
+                            Text("Les réponses utilisent sa transcription et son analyse. " +
+                                "Cette discussion sera effacée en quittant.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    items(messages) { msg ->
+                        val mine = msg.role == "user"
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+                            Surface(shape = RoundedCornerShape(18.dp),
+                                color = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.widthIn(max = 310.dp)) {
+                                Text(msg.content, Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+                                    style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                    }
+                    if (busy) item {
+                        Row(verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp)
+                            Text("Réponse en cours…", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                HorizontalDivider()
+                Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(input, { input = it }, modifier = Modifier.weight(1f),
+                        placeholder = { Text("Écris ta question…") }, maxLines = 4,
+                        shape = RoundedCornerShape(24.dp),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                        keyboardActions = KeyboardActions(onSend = {
+                            if (input.isNotBlank() && !busy) { onAsk(input.trim()); input = ""; keyboard?.hide() }
+                        }))
+                    IconButton(onClick = { onAsk(input.trim()); input = ""; keyboard?.hide() },
+                        enabled = input.isNotBlank() && !busy) {
+                        Icon(Icons.Default.Send, "Envoyer", tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+        }
+    }
 }

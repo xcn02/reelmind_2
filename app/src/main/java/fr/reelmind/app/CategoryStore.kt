@@ -7,6 +7,15 @@ import org.json.JSONObject
 data class ReelCategory(val name: String, val icon: String, val color: Long, val keywords: List<String> = emptyList())
 
 object CategoryStore {
+    const val UNCLASSIFIED = "À classer"
+    val unclassified = ReelCategory(UNCLASSIFIED, "📥", 0xFF6386B4)
+    private fun withUnclassified(items: List<ReelCategory>): List<ReelCategory> {
+        val distinct = items.filter { it.name.isNotBlank() }.distinctBy { it.name.lowercase() }
+        // Honor an existing user-selected position. Older preferences get a default first position.
+        return if (distinct.any { it.name.equals(UNCLASSIFIED, true) })
+            distinct.map { if (it.name.equals(UNCLASSIFIED, true)) unclassified else it }
+        else listOf(unclassified) + distinct
+    }
     private val defaults = listOf(
         ReelCategory("Technologie", "💻", 0xFF4895EF),
         ReelCategory("Travail", "💼", 0xFF6478D9),
@@ -36,12 +45,12 @@ object CategoryStore {
     }
     fun list(context: Context): List<ReelCategory> {
         val prefs = context.getSharedPreferences("settings", 0)
-        return if (prefs.contains("categories_all")) readCustom(context)
-            else (defaults + readCustom(context)).distinctBy { it.name.lowercase() }
+        return withUnclassified(if (prefs.contains("categories_all")) readCustom(context)
+            else (defaults + readCustom(context)).distinctBy { it.name.lowercase() })
     }
     fun replaceAll(context: Context, categories: List<ReelCategory>) {
         val arr = JSONArray()
-        categories.distinctBy { it.name.trim().lowercase() }.forEach { cat ->
+        withUnclassified(categories).forEach { cat ->
             require(cat.name.isNotBlank() && cat.name.length <= 35)
             arr.put(JSONObject().put("name", cat.name.trim()).put("icon", cat.icon).put("color", cat.color)
                 .put("keywords", JSONArray(cat.keywords.map { it.trim().lowercase() }.filter { it.isNotBlank() }.distinct().take(10))))
@@ -57,7 +66,7 @@ object CategoryStore {
     fun classifyKeywords(text: String, context: Context): String? {
         val normalized = java.text.Normalizer.normalize(text.lowercase(), java.text.Normalizer.Form.NFD)
             .replace(Regex("\\p{M}+"), "")
-        val scores = list(context).map { category ->
+        val scores = list(context).filterNot { it.name == UNCLASSIFIED }.map { category ->
             category to category.keywords.count { raw ->
                 val keyword = java.text.Normalizer.normalize(raw.lowercase().trim(), java.text.Normalizer.Form.NFD)
                     .replace(Regex("\\p{M}+"), "")
@@ -71,7 +80,7 @@ object CategoryStore {
     fun classifyFromAnswer(answer: String, context: Context, fallbackText: String): String {
         val found = Regex("(?im)^\\s*(?:catégorie|categorie)\\s*:\\s*(.+)$").find(answer)?.groupValues?.get(1)?.trim()?.trim('*', '#', ' ', '.')
         return classifyKeywords(fallbackText, context)
-            ?: list(context).firstOrNull { it.name.equals(found, true) }?.name ?: guess(fallbackText, context)
+            ?: list(context).firstOrNull { it.name != UNCLASSIFIED && it.name.equals(found, true) }?.name ?: guess(fallbackText, context)
     }
     fun guess(text: String, context: Context): String {
         classifyKeywords(text, context)?.let { return it }

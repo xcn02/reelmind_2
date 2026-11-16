@@ -79,6 +79,7 @@ data class ChatMessage(@PrimaryKey(autoGenerate = true) val id: Long = 0, val re
     @Query("SELECT * FROM chat_messages WHERE reelId = :reelId ORDER BY id ASC") fun observe(reelId: Long): Flow<List<ChatMessage>>
     @Insert suspend fun insert(message: ChatMessage)
     @Query("DELETE FROM chat_messages WHERE reelId = :reelId") suspend fun clear(reelId: Long)
+    @Query("DELETE FROM chat_messages") suspend fun clearAll()
 }
 @Database(entities = [Reel::class, ChatMessage::class], version = 6, exportSchema = false)
 abstract class ReelDatabase : RoomDatabase() { abstract fun dao(): ReelDao; abstract fun chatDao(): ChatDao }
@@ -132,6 +133,7 @@ class ReelModel : ViewModel() {
     var messages by mutableStateOf<List<ChatMessage>>(emptyList()); private set
     var chatAnswering by mutableStateOf(false); private set
     private var chatJob: kotlinx.coroutines.Job? = null
+    private var chatSession = 0L
     private lateinit var chatDao: ChatDao
     private lateinit var dao: ReelDao
     private var initialized = false
@@ -164,6 +166,8 @@ class ReelModel : ViewModel() {
                 }
                 dao = databaseDao.dao()
                 chatDao = databaseDao.chatDao()
+                chatDao.clearAll() // Remove conversations saved by older versions.
+                CacheMaintenance.cleanOrphans(appContext)
                 dao.observe().collectLatest { reels = it; isLoading = false }
             } catch (e: Exception) {
                 isLoading = false
@@ -229,54 +233,83 @@ class ReelModel : ViewModel() {
             } finally { processingId = null }
         }
     }
-    fun observeChat(reelId: Long) {
-        if (!::chatDao.isInitialized) return
+    // Ephemeral chat: no messages are persisted, even when the app is killed.
+    fun startChat(reelId: Long) {
         chatJob?.cancel()
+        chatSession++
         messages = emptyList()
-        chatJob = viewModelScope.launch { chatDao.observe(reelId).collectLatest { messages = it } }
+        chatAnswering = false
+    }
+    fun endChat() {
+        chatSession++
+        chatJob?.cancel()
+        chatJob = null
+        messages = emptyList()
+        chatAnswering = false
     }
     fun askReel(reel: Reel, question: String) {
-        if (!::chatDao.isInitialized || chatAnswering || question.isBlank()) return
-        if (reel.sourceText.isBlank() && reel.summary.isBlank()) {
-            aiError = "Ajoute un texte source ou un résumé pour discuter avec ce Reel"; return
+        val clean = question.trim()
+        if (chatAnswering || clean.isBlank()) return
+        if (reel.mediaText.isBlank() && reel.summary.isBlank() && !reel.sourceText.contains("Analyse des images :")) {
+            aiError = "Cette fiche doit être analysée avant de pouvoir en discuter"; return
         }
+        val session = chatSession
+        val history = messages.takeLast(6).joinToString("\n") { "${it.role}: ${it.content}" }
+        messages = messages + ChatMessage(reelId = reel.id, role = "user", content = clean)
         chatAnswering = true
-        viewModelScope.launch {
+        chatJob = viewModelScope.launch {
             try {
-                chatDao.insert(ChatMessage(reelId = reel.id, role = "user", content = question))
-                val context = messages.takeLast(12).joinToString("\n") { "${it.role}: ${it.content}" }
                 val answer = withContext(Dispatchers.IO) {
                     AiProviders.ask(provider, modelName, apiKey, ollamaUrl,
-                        "Tu réponds en français à des questions sur une publication enregistrée. " +
-                            "Appuie-toi uniquement sur le contenu fourni, précise les limites et n'invente rien.",
-                        "Titre : ${reel.title}\nTexte : ${reel.sourceText.take(20000)}\n" +
-                            "Résumé : ${reel.summary.take(10000)}\nHistorique :\n$context\nQuestion : $question")
+                        "Tu es un assistant français qui répond uniquement à partir du contenu d'une fiche ReelMind. " +
+                        "Sois concis, précis et indique explicitement les limites du contenu disponible.",
+                        "Titre : ${reel.title}\nTranscription : ${reel.mediaText.take(10000)}\n" +
+                        "Observations visuelles : ${reel.sourceText.substringAfter("Analyse des images :", "").take(4000)}\n" +
+                        "Résumé : ${reel.summary.take(5000)}\nHistorique :\n$history\nQuestion : $clean")
                 }
-                chatDao.insert(ChatMessage(reelId = reel.id, role = "assistant", content = answer))
-            } catch (e: Exception) { aiError = "Discussion : ${e.message ?: "erreur réseau"}" }
-            finally { chatAnswering = false }
+                if (session == chatSession) messages = messages + ChatMessage(reelId = reel.id, role = "assistant", content = answer)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (session == chatSession) aiError = "Discussion : ${e.message ?: "erreur réseau"}"
+            } finally {
+                if (session == chatSession) chatAnswering = false
+            }
         }
     }
-    fun askLibrary(question: String) {
+    private var libraryJob: kotlinx.coroutines.Job? = null
+    private var librarySession = 0L
+    fun endLibraryChat() {
+        librarySession++
+        libraryJob?.cancel()
+        libraryJob = null
+        libraryAsking = false
+        libraryAnswer = ""
+    }
+    fun askLibrary(question: String, conversation: String = "") {
         if (libraryAsking || question.isBlank()) return
         val relevant = reels.filter { it.summary.isNotBlank() || it.sourceText.isNotBlank() }
         if (relevant.isEmpty()) { libraryAnswer = "Aucune fiche analysable dans la bibliothèque."; return }
         libraryAsking = true
         libraryAnswer = ""
-        viewModelScope.launch {
+        val session = librarySession
+        libraryJob = viewModelScope.launch {
             try {
                 // Bounded context: it is a basic library question-answer feature, not vector search.
                 val context = relevant.take(25).joinToString("\n\n") {
                     "ID ${it.id} | ${it.title} | ${it.url}\n${it.summary.ifBlank { it.sourceText }.take(1100)}"
                 }
-                libraryAnswer = withContext(Dispatchers.IO) {
+                val answer = withContext(Dispatchers.IO) {
                     AiProviders.ask(provider, modelName, apiKey, ollamaUrl,
                         "Réponds en français uniquement d'après les fiches fournies. Cite les titres " +
                         "ou URL des fiches utilisées. Explique si les résultats sont insuffisants.",
-                        "Fiches enregistrées (maximum 25):\n$context\n\nQuestion : $question")
+                        "Fiches enregistrées (maximum 25):\n$context\n\n" +
+                            "Conversation temporaire :\n${conversation.takeLast(3000)}\n\nQuestion : $question")
                 }
-            } catch (e: Exception) { libraryAnswer = "Erreur : ${e.message ?: "appel IA impossible"}" }
-            finally { libraryAsking = false }
+                if (session == librarySession) libraryAnswer = answer
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+              catch (e: Exception) { if (session == librarySession) libraryAnswer = "Erreur : ${e.message ?: "appel IA impossible"}" }
+            finally { if (session == librarySession) libraryAsking = false }
         }
     }
     fun requeueUnfinished() {

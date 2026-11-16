@@ -36,7 +36,11 @@ data class ExtractedContent(
     val images: List<File> = emptyList(), val ownedFiles: List<File> = emptyList(),
     val diagnostics: String = "", val imageUrls: List<String> = emptyList()
 ) {
-    fun cleanup() { ownedFiles.forEach { runCatching { it.delete(); it.parentFile?.takeIf { dir -> dir.name.startsWith("reelmind_") && dir.listFiles()?.isEmpty() == true }?.delete() } } }
+    fun cleanup() {
+        val folders = ownedFiles.mapNotNull { it.parentFile }.filter { it.name.startsWith("reelmind_") }.distinct()
+        ownedFiles.forEach { runCatching { it.delete() } }
+        folders.forEach { runCatching { it.deleteRecursively() } }
+    }
 }
 
 object ExtractionCoordinator {
@@ -206,9 +210,12 @@ object LocalExtractor {
                 }
             }
         } catch (error: Exception) {
-            files.forEach { runCatching { it.delete() } }
+            folder.deleteRecursively()
             throw error
         }
+        // Remove partial yt-dlp files, even when an extractor attempt was unsuccessful.
+        folder.listFiles()?.filterNot { it in files }?.forEach { runCatching { it.deleteRecursively() } }
+        if (files.isEmpty()) folder.deleteRecursively()
         return ExtractedContent(title, caption, author, thumbnail, kind, audio, images, ownedFiles = files)
     }
 }

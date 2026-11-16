@@ -11,8 +11,8 @@ android {
         applicationId = "fr.reelmind.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.5.3.2"
+        versionCode = 14
+        versionName = "0.5.4"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
     signingConfigs {
